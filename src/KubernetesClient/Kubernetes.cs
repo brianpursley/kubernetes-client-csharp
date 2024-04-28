@@ -75,22 +75,18 @@ namespace k8s
                 httpResponse.Content = new LineSeparatedHttpContent(httpResponse.Content, cancellationToken);
             }
 
+#if NET5_0_OR_GREATER
+            var stream = await httpResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+#else
+            var stream = await httpResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
+#endif
             try
             {
-#if NET5_0_OR_GREATER
-                using (Stream stream = await httpResponse.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
-#else
-                using (Stream stream = await httpResponse.Content.ReadAsStreamAsync().ConfigureAwait(false))
-#endif
-                {
-                    result.Body = KubernetesJson.Deserialize<T>(stream, jsonSerializerOptions);
-                }
+                result.Body = KubernetesJson.Deserialize<T>(stream, jsonSerializerOptions);
             }
-            catch (JsonException)
+            finally
             {
-                httpRequest.Dispose();
-                httpResponse.Dispose();
-                throw;
+                await stream.DisposeAsync().ConfigureAwait(false);
             }
 
             return result;
@@ -98,7 +94,7 @@ namespace k8s
 
         protected override Task<HttpResponseMessage> SendRequest<T>(string relativeUri, HttpMethod method, IReadOnlyDictionary<string, IReadOnlyList<string>> customHeaders, T body, CancellationToken cancellationToken)
         {
-            var httpRequest = new HttpRequestMessage
+            using var httpRequest = new HttpRequestMessage
             {
                 Method = method,
                 RequestUri = new Uri(BaseUri, relativeUri),
@@ -153,31 +149,23 @@ namespace k8s
             // Send Request
             cancellationToken.ThrowIfCancellationRequested();
             var httpResponse = await HttpClient.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-            HttpStatusCode statusCode = httpResponse.StatusCode;
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!httpResponse.IsSuccessStatusCode)
+            try
             {
-                string responseContent = null;
-                if (httpResponse.Content != null)
-                {
-                    responseContent = await httpResponse.Content.ReadAsStringAsync().ConfigureAwait(false);
-                }
-                else
-                {
-                    responseContent = string.Empty;
-                }
+                cancellationToken.ThrowIfCancellationRequested();
 
-                var ex = new HttpOperationException($"Operation returned an invalid status code '{statusCode}', response body {responseContent}");
-                ex.Request = new HttpRequestMessageWrapper(httpRequest, requestContent);
-                ex.Response = new HttpResponseMessageWrapper(httpResponse, responseContent);
-                httpRequest.Dispose();
-                if (httpResponse != null)
+                if (!httpResponse.IsSuccessStatusCode)
                 {
-                    httpResponse.Dispose();
+                    var responseContent = await httpResponse.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                    throw new HttpOperationException($"Operation returned an invalid status code '{httpResponse.StatusCode}', response body {responseContent}")
+                    {
+                        Request = new HttpRequestMessageWrapper(httpRequest, requestContent),
+                        Response = new HttpResponseMessageWrapper(httpResponse, responseContent),
+                    };
                 }
-
-                throw ex;
+            }
+            finally
+            {
+                httpResponse.Dispose();
             }
 
             return httpResponse;
